@@ -3,7 +3,7 @@ mod safe_name;
 pub mod test_dsl;
 mod walker;
 
-pub use walker::rename_all_identifiers;
+pub use walker::{rename_all_identifiers, rename_all_identifiers_with_progress, RenameProgress};
 
 pub trait Renamer {
     /// Returns the new name for the identifier. Returning the same string means "leave it alone".
