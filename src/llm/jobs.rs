@@ -29,7 +29,7 @@ impl JobRunner {
         let mut last_error = None;
 
         for attempt in 1..=attempts {
-            match self.call_once(&job).await {
+            match self.run_job_once(&job).await {
                 Ok(validated) => return Ok(validated),
                 Err(err) => {
                     last_error = Some(err);
@@ -57,7 +57,7 @@ impl JobRunner {
         ))
     }
 
-    async fn call_once(&self, job: &LlmBatchJob) -> Result<ValidatedBatch> {
+    pub async fn run_job_once(&self, job: &LlmBatchJob) -> Result<ValidatedBatch> {
         let schema = json!({
             "type": "object",
             "additionalProperties": false,

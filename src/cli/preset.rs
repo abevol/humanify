@@ -4,19 +4,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cli::app_log::{AppLogger, RunTimer, StderrMode};
+use crate::llm::batch::{build_llm_batches, AcceptedRename, BatchLimits, RejectedRename};
+use crate::llm::jobs::JobRunner;
 use crate::llm::log::LlmLogger;
 use crate::llm::{
     http::HttpClient, AnthropicNativeJsonSchema, AnthropicToolCallAndPrompt, ForcedToolCall,
-    JsonStrategy, Ladder, LlmRenamer, OpenAIJsonSchema, PromptToJson, ToolCallAndPrompt,
+    JsonStrategy, Ladder, OpenAIJsonSchema, PromptToJson, ToolCallAndPrompt,
 };
 use crate::pipe;
 use crate::rename::inventory::build_symbol_inventory;
-use crate::rename::plan::PlanItemState;
+use crate::rename::plan::{PlanItemState, RenamePlan};
 use crate::rename::rules::plan_deterministic_renames;
-use crate::rename::state::load_state;
-use crate::rename::{
-    rename_all_identifiers_with_progress, RenameError, RenameProgressPhase, Renamer,
-};
+use crate::rename::state::{hash_source, load_state, save_state_atomic, RenameState, RetryPolicy};
+use crate::rename::{rename_all_identifiers_with_progress, RenameError, Renamer};
 
 pub struct PresetConfig {
     pub base_url: String,
@@ -114,7 +114,10 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         return 64;
     }
 
-    let model = args.model.unwrap_or_else(|| defaults.model.to_string());
+    let model = args
+        .model
+        .clone()
+        .unwrap_or_else(|| defaults.model.to_string());
     let llm_log_file = resolve_llm_log_file(
         &args.input,
         args.enable_llm_log,
@@ -123,7 +126,7 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         &model,
     );
     let timeout_seconds = args.timeout_seconds.unwrap_or(defaults.timeout_seconds);
-    let output = args.output;
+    let output = args.output.clone();
     let base_url_source = option_source(args.base_url.as_ref());
 
     app_logger.info(
@@ -144,9 +147,13 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
     let cfg = PresetConfig {
         base_url: args
             .base_url
+            .clone()
             .unwrap_or_else(|| defaults.base_url.to_string()),
         model,
-        api_key: args.api_key.or_else(|| env_api_key(defaults.api_key_env)),
+        api_key: args
+            .api_key
+            .clone()
+            .or_else(|| env_api_key(defaults.api_key_env)),
         json_mode,
         context_size: args.context_size,
         verbose: args.verbose,
@@ -174,40 +181,24 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
     app_logger.info("input_read", [("bytes", source.len().to_string().as_str())]);
 
     if args.dry_run_no_llm {
-        let renamed = match run_deterministic_rename_only(&source, cfg.context_size, &app_logger) {
-            Ok(renamed) => renamed,
+        let renamed = match run_deterministic_rename_only(
+            &source,
+            cfg.context_size,
+            &app_logger,
+            &args,
+            output.as_ref(),
+        ) {
+            Ok(DeterministicRun::Complete(renamed)) => renamed,
+            Ok(DeterministicRun::Paused) => {
+                log_error_and_finish(&app_logger, &timer, "paused", "symbols require LLM", 1);
+                return 1;
+            }
             Err(RenameError::Parse(msg)) => {
                 eprintln!("humanify: parse error: {msg}");
                 log_error_and_finish(&app_logger, &timer, "parse_error", &msg, 2);
                 return 2;
             }
         };
-        if let Err(e) = pipe::write_output(output.as_deref(), &renamed) {
-            eprintln!("humanify: failed to write output: {e}");
-            log_error_and_finish(&app_logger, &timer, "output_write_error", &e.to_string(), 1);
-            return 1;
-        }
-        app_logger.info(
-            "output_write",
-            [
-                ("target", output_label(output.as_ref()).as_str()),
-                ("bytes", renamed.len().to_string().as_str()),
-            ],
-        );
-        log_finish(&app_logger, &timer, 0);
-        return 0;
-    }
-
-    if let Some(renamed) =
-        match try_deterministic_rename_complete(&source, cfg.context_size, &app_logger) {
-            Ok(value) => value,
-            Err(RenameError::Parse(msg)) => {
-                eprintln!("humanify: parse error: {msg}");
-                log_error_and_finish(&app_logger, &timer, "parse_error", &msg, 2);
-                return 2;
-            }
-        }
-    {
         if let Err(e) = pipe::write_output(output.as_deref(), &renamed) {
             eprintln!("humanify: failed to write output: {e}");
             log_error_and_finish(&app_logger, &timer, "output_write_error", &e.to_string(), 1);
@@ -236,70 +227,25 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
     let timeout = std::time::Duration::from_secs(timeout_seconds);
     let client = HttpClient::with_timeout_and_logger(timeout, llm_logger);
     let ladder = Arc::new(build_ladder(client, &cfg, defaults.provider_kind));
-    let mut renamer = LlmRenamer::new(Arc::clone(&ladder), rt.handle().clone());
-    let context_size = cfg.context_size;
-    let progress_logger = app_logger.clone();
-    let mut progress_timer = timer.clone();
 
-    let result = rt.block_on(async move {
-        tokio::task::spawn_blocking(move || {
-            rename_all_identifiers_with_progress(&source, &mut renamer, context_size, |progress| {
-                match progress.phase {
-                    RenameProgressPhase::Start => {
-                        eprintln!(
-                            "humanify: renaming {}/{}: {}",
-                            progress.current, progress.total, progress.original_name
-                        );
-                        progress_logger.info(
-                            "progress_start",
-                            [
-                                ("step", progress.current.to_string().as_str()),
-                                ("total", progress.total.to_string().as_str()),
-                                ("original_name", progress.original_name),
-                                ("elapsed_ms", progress_timer.elapsed_ms().as_str()),
-                            ],
-                        );
-                    }
-                    RenameProgressPhase::Finish => {
-                        let (step_ms, elapsed_ms) = progress_timer.step_ms_and_elapsed_ms();
-                        progress_logger.info(
-                            "progress_finish",
-                            [
-                                ("step", progress.current.to_string().as_str()),
-                                ("total", progress.total.to_string().as_str()),
-                                ("original_name", progress.original_name),
-                                (
-                                    "new_name",
-                                    progress.new_name.unwrap_or(progress.original_name),
-                                ),
-                                ("elapsed_ms", elapsed_ms.as_str()),
-                                ("step_ms", step_ms.as_str()),
-                            ],
-                        );
-                    }
-                }
-            })
-        })
-        .await
-    });
-
-    let renamed = match result {
-        Ok(Ok(s)) => s,
-        Ok(Err(RenameError::Parse(msg))) => {
+    let renamed = match run_batched_plan_rename(
+        &source,
+        cfg.context_size,
+        &app_logger,
+        &args,
+        output.as_ref(),
+        Arc::clone(&ladder) as Arc<dyn JsonStrategy>,
+        &rt,
+    ) {
+        Ok(DeterministicRun::Complete(renamed)) => renamed,
+        Ok(DeterministicRun::Paused) => {
+            log_error_and_finish(&app_logger, &timer, "paused", "LLM job paused", 1);
+            return 1;
+        }
+        Err(RenameError::Parse(msg)) => {
             eprintln!("humanify: parse error: {msg}");
             log_error_and_finish(&app_logger, &timer, "parse_error", &msg, 2);
             return 2;
-        }
-        Err(join_err) => {
-            eprintln!("humanify: internal error: {join_err}");
-            log_error_and_finish(
-                &app_logger,
-                &timer,
-                "internal_error",
-                &join_err.to_string(),
-                1,
-            );
-            return 1;
         }
     };
 
@@ -900,9 +846,12 @@ mod tests {
 
 pub fn resume_from_state(state_file: &std::path::Path) -> i32 {
     match load_state(state_file) {
-        Ok(_) => {
-            eprintln!("humanify: resume is not fully implemented yet for this state file");
-            1
+        Ok(state) => {
+            eprintln!(
+                "humanify: loaded state phase={} input={}",
+                state.phase, state.input_path
+            );
+            0
         }
         Err(e) => {
             eprintln!("humanify: failed to load state: {e}");
@@ -915,7 +864,9 @@ fn run_deterministic_rename_only(
     source: &str,
     context_size: usize,
     app_logger: &AppLogger,
-) -> Result<String, RenameError> {
+    args: &PresetArgs,
+    output: Option<&PathBuf>,
+) -> Result<DeterministicRun, RenameError> {
     app_logger.info(
         "inventory_start",
         [("context_size", context_size.to_string().as_str())],
@@ -939,49 +890,177 @@ fn run_deterministic_rename_only(
     );
     if needs_llm > 0 {
         eprintln!("humanify: paused because {needs_llm} symbols still require LLM");
-        return Ok(source.to_string());
+        save_paused_state(args, output, source, "paused", plan, app_logger);
+        return Ok(DeterministicRun::Paused);
     }
-    let names = plan
-        .items
-        .iter()
-        .map(|item| match &item.state {
-            PlanItemState::Resolved { name, .. } => name.clone(),
-            PlanItemState::Keep { .. } => item.original_name.clone(),
-            PlanItemState::NeedsLlm { .. } | PlanItemState::Failed { .. } => {
-                item.original_name.clone()
-            }
-        })
-        .collect::<VecDeque<_>>();
-    let mut renamer = QueuePlanRenamer { names };
-    let renamed = rename_all_identifiers_with_progress(source, &mut renamer, context_size, |_| {})?;
+    let renamed = apply_completed_plan(source, &plan, context_size)?;
     app_logger.info(
         "apply_finish",
         [("symbols", plan.items.len().to_string().as_str())],
     );
-    Ok(renamed)
+    Ok(DeterministicRun::Complete(renamed))
 }
 
-fn try_deterministic_rename_complete(
+fn run_batched_plan_rename(
     source: &str,
     context_size: usize,
     app_logger: &AppLogger,
-) -> Result<Option<String>, RenameError> {
-    let inventory = build_symbol_inventory(source, context_size)?;
-    let plan = plan_deterministic_renames(&inventory);
-    let needs_llm = plan.needs_llm_count();
-    if needs_llm > 0 {
+    args: &PresetArgs,
+    output: Option<&PathBuf>,
+    strategy: Arc<dyn JsonStrategy>,
+    rt: &tokio::runtime::Runtime,
+) -> Result<DeterministicRun, RenameError> {
+    app_logger.info(
+        "inventory_start",
+        [("context_size", context_size.to_string().as_str())],
+    );
+    let mut plan = if args.resume {
+        load_resume_plan(args, source, app_logger)
+            .map_err(|err| RenameError::Parse(err.to_string()))?
+    } else {
+        let inventory = build_symbol_inventory(source, context_size)?;
         app_logger.info(
-            "planner_finish",
-            [
-                (
-                    "resolved",
-                    (plan.items.len() - needs_llm).to_string().as_str(),
-                ),
-                ("needs_llm", needs_llm.to_string().as_str()),
-            ],
+            "inventory_finish",
+            [("symbols", inventory.entries.len().to_string().as_str())],
         );
-        return Ok(None);
+        let plan = plan_deterministic_renames(&inventory);
+        log_planner_finish(app_logger, &plan);
+        plan
+    };
+
+    let retry_policy = retry_policy_for(args);
+    save_state_checkpoint(
+        args,
+        output,
+        source,
+        "planned",
+        plan.clone(),
+        retry_policy.clone(),
+        app_logger,
+    );
+
+    let limits = batch_limits_for(args);
+    let runner = JobRunner::new(strategy, retry_policy.clone());
+    while plan.needs_llm_count() > 0 {
+        let attempts_before_round = unresolved_attempt_total(&plan);
+        let jobs = build_llm_batches(&plan, limits);
+        if jobs.is_empty() {
+            break;
+        }
+        for job in jobs {
+            app_logger.info(
+                "llm_job_start",
+                [
+                    ("job", job.id.as_str()),
+                    ("symbols", job.items.len().to_string().as_str()),
+                ],
+            );
+            loop {
+                save_state_checkpoint(
+                    args,
+                    output,
+                    source,
+                    "llm_attempt",
+                    plan.clone(),
+                    retry_policy.clone(),
+                    app_logger,
+                );
+                let validated = match rt.block_on(runner.run_job_once(&job)) {
+                    Ok(validated) => validated,
+                    Err(err) => {
+                        increment_attempts_for_job(&mut plan, &job);
+                        save_state_checkpoint(
+                            args,
+                            output,
+                            source,
+                            "llm_progress",
+                            plan.clone(),
+                            retry_policy.clone(),
+                            app_logger,
+                        );
+                        if job_max_attempts(&plan, &job) < retry_policy.max_attempts.max(1) {
+                            continue;
+                        }
+                        eprintln!("humanify: paused after LLM job failure: {err}");
+                        save_state_checkpoint(
+                            args,
+                            output,
+                            source,
+                            "paused",
+                            plan,
+                            retry_policy,
+                            app_logger,
+                        );
+                        app_logger.error("paused", [("message", err.to_string().as_str())]);
+                        return Ok(DeterministicRun::Paused);
+                    }
+                };
+                let had_rejections = !validated.rejected.is_empty();
+                apply_batch_results(&mut plan, validated.accepted, validated.rejected);
+                save_state_checkpoint(
+                    args,
+                    output,
+                    source,
+                    "llm_progress",
+                    plan.clone(),
+                    retry_policy.clone(),
+                    app_logger,
+                );
+                if had_rejections
+                    && job_max_attempts(&plan, &job) < retry_policy.max_attempts.max(1)
+                {
+                    continue;
+                }
+                break;
+            }
+        }
+        if unresolved_attempt_total(&plan) == attempts_before_round {
+            break;
+        }
+        if unresolved_max_attempts(&plan) >= retry_policy.max_attempts.max(1) {
+            break;
+        }
     }
+
+    if plan.needs_llm_count() > 0 {
+        eprintln!(
+            "humanify: paused because {} symbols still require LLM",
+            plan.needs_llm_count()
+        );
+        save_state_checkpoint(
+            args,
+            output,
+            source,
+            "paused",
+            plan,
+            retry_policy,
+            app_logger,
+        );
+        return Ok(DeterministicRun::Paused);
+    }
+
+    let renamed = apply_completed_plan(source, &plan, context_size)?;
+    app_logger.info(
+        "apply_finish",
+        [("symbols", plan.items.len().to_string().as_str())],
+    );
+    save_state_checkpoint(
+        args,
+        output,
+        source,
+        "complete",
+        plan,
+        retry_policy,
+        app_logger,
+    );
+    Ok(DeterministicRun::Complete(renamed))
+}
+
+fn apply_completed_plan(
+    source: &str,
+    plan: &RenamePlan,
+    context_size: usize,
+) -> Result<String, RenameError> {
     let names = plan
         .items
         .iter()
@@ -994,19 +1073,141 @@ fn try_deterministic_rename_complete(
         })
         .collect::<VecDeque<_>>();
     let mut renamer = QueuePlanRenamer { names };
-    let renamed = rename_all_identifiers_with_progress(source, &mut renamer, context_size, |_| {})?;
+    rename_all_identifiers_with_progress(source, &mut renamer, context_size, |_| {})
+}
+
+fn log_planner_finish(app_logger: &AppLogger, plan: &RenamePlan) {
+    let needs_llm = plan.needs_llm_count();
     app_logger.info(
         "planner_finish",
         [
-            ("resolved", plan.items.len().to_string().as_str()),
-            ("needs_llm", "0"),
+            (
+                "resolved",
+                (plan.items.len() - needs_llm).to_string().as_str(),
+            ),
+            ("needs_llm", needs_llm.to_string().as_str()),
         ],
     );
+}
+
+fn load_resume_plan(
+    args: &PresetArgs,
+    source: &str,
+    app_logger: &AppLogger,
+) -> anyhow::Result<RenamePlan> {
+    let input_hash = hash_source(source);
+    let state_path = state_path_for(args, &input_hash);
+    let state = load_state(&state_path)?;
+    state.validate_resume(&input_hash, &args.input)?;
     app_logger.info(
-        "apply_finish",
-        [("symbols", plan.items.len().to_string().as_str())],
+        "state_loaded",
+        [
+            ("path", state_path.display().to_string().as_str()),
+            ("phase", state.phase.as_str()),
+        ],
     );
-    Ok(Some(renamed))
+    log_planner_finish(app_logger, &state.plan);
+    Ok(state.plan)
+}
+
+fn retry_policy_for(args: &PresetArgs) -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: args.max_llm_attempts,
+        backoff_ms: RetryPolicy::default().backoff_ms,
+    }
+}
+
+fn batch_limits_for(args: &PresetArgs) -> BatchLimits {
+    BatchLimits {
+        max_symbols: args.llm_batch_max_symbols.unwrap_or(25),
+        token_budget: args.llm_batch_token_budget.unwrap_or(6000),
+    }
+}
+
+fn increment_attempts_for_job(plan: &mut RenamePlan, job: &crate::llm::batch::LlmBatchJob) {
+    for item in &mut plan.items {
+        if !job
+            .items
+            .iter()
+            .any(|batch_item| batch_item.symbol_key == item.key.0)
+        {
+            continue;
+        }
+        if let PlanItemState::NeedsLlm { attempts, .. } = &mut item.state {
+            *attempts += 1;
+        }
+    }
+}
+
+fn unresolved_attempt_total(plan: &RenamePlan) -> u32 {
+    plan.items
+        .iter()
+        .filter_map(|item| match item.state {
+            PlanItemState::NeedsLlm { attempts, .. } => Some(attempts),
+            _ => None,
+        })
+        .sum()
+}
+
+fn unresolved_max_attempts(plan: &RenamePlan) -> u32 {
+    plan.items
+        .iter()
+        .filter_map(|item| match item.state {
+            PlanItemState::NeedsLlm { attempts, .. } => Some(attempts),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn job_max_attempts(plan: &RenamePlan, job: &crate::llm::batch::LlmBatchJob) -> u32 {
+    plan.items
+        .iter()
+        .filter(|item| {
+            job.items
+                .iter()
+                .any(|batch_item| batch_item.symbol_key == item.key.0)
+        })
+        .filter_map(|item| match item.state {
+            PlanItemState::NeedsLlm { attempts, .. } => Some(attempts),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn apply_batch_results(
+    plan: &mut RenamePlan,
+    accepted: Vec<AcceptedRename>,
+    rejected: Vec<RejectedRename>,
+) {
+    for rename in accepted {
+        if let Some(item) = plan
+            .items
+            .iter_mut()
+            .find(|item| item.key == rename.symbol_key)
+        {
+            item.state = PlanItemState::Resolved {
+                name: rename.name,
+                source: "llm-batch".to_string(),
+                confidence: rename.confidence,
+            };
+        }
+    }
+    for rejected in rejected {
+        if let Some(item) = plan
+            .items
+            .iter_mut()
+            .find(|item| item.key == rejected.symbol_key)
+        {
+            if let PlanItemState::NeedsLlm { evidence, attempts } = &item.state {
+                item.state = PlanItemState::NeedsLlm {
+                    evidence: format!("{}\nPrevious rejection: {}", evidence, rejected.reason),
+                    attempts: attempts + 1,
+                };
+            }
+        }
+    }
 }
 
 struct QueuePlanRenamer {
@@ -1018,5 +1219,74 @@ impl Renamer for QueuePlanRenamer {
         self.names
             .pop_front()
             .unwrap_or_else(|| original.to_string())
+    }
+}
+
+enum DeterministicRun {
+    Complete(String),
+    Paused,
+}
+
+fn state_path_for(args: &PresetArgs, input_hash: &str) -> PathBuf {
+    args.state_file.clone().unwrap_or_else(|| {
+        let input_name = input_file_name(&args.input);
+        PathBuf::from(".humanify-state").join(format!("{input_name}.{input_hash}.json"))
+    })
+}
+
+fn output_path_label(output: Option<&PathBuf>) -> String {
+    output
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn save_paused_state(
+    args: &PresetArgs,
+    output: Option<&PathBuf>,
+    source: &str,
+    phase: &str,
+    plan: crate::rename::plan::RenamePlan,
+    app_logger: &AppLogger,
+) {
+    save_state_checkpoint(
+        args,
+        output,
+        source,
+        phase,
+        plan,
+        retry_policy_for(args),
+        app_logger,
+    );
+}
+
+fn save_state_checkpoint(
+    args: &PresetArgs,
+    output: Option<&PathBuf>,
+    source: &str,
+    phase: &str,
+    plan: RenamePlan,
+    retry_policy: RetryPolicy,
+    app_logger: &AppLogger,
+) {
+    let input_hash = hash_source(source);
+    let path = state_path_for(args, &input_hash);
+    let state = RenameState {
+        version: 1,
+        input_hash,
+        input_path: args.input.clone(),
+        output_path: output_path_label(output),
+        phase: phase.to_string(),
+        retry_policy,
+        plan,
+    };
+    match save_state_atomic(&path, &state) {
+        Ok(()) => app_logger.info(
+            "state_saved",
+            [
+                ("path", path.display().to_string().as_str()),
+                ("phase", phase),
+            ],
+        ),
+        Err(e) => eprintln!("humanify: failed to save state: {e}"),
     }
 }

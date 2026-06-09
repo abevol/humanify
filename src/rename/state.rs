@@ -8,6 +8,12 @@ use sha2::{Digest, Sha256};
 
 use super::plan::{RenamePlan, StableSymbolKey};
 
+pub fn hash_source(source: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 impl StableSymbolKey {
     pub fn new(
         input_hash: &str,
