@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod http;
 pub mod ladder;
+pub mod log;
 pub mod openai_compat;
 pub mod renamer;
 #[cfg(test)]

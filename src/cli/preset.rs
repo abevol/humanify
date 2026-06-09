@@ -2,6 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::llm::log::LlmLogger;
 use crate::llm::{
     http::HttpClient, AnthropicNativeJsonSchema, AnthropicToolCallAndPrompt, ForcedToolCall,
     JsonStrategy, Ladder, LlmRenamer, OpenAIJsonSchema, PromptToJson, ToolCallAndPrompt,
@@ -26,6 +27,7 @@ pub enum ProviderKind {
 
 #[derive(Clone, Copy)]
 pub struct PresetDefaults {
+    pub provider_name: &'static str,
     pub base_url: &'static str,
     pub model: &'static str,
     pub api_key_env: &'static str,
@@ -47,6 +49,8 @@ pub struct PresetArgs {
     pub json_mode: String,
     pub verbose: bool,
     pub timeout_seconds: Option<u64>,
+    pub enable_llm_log: bool,
+    pub llm_log_file: Option<PathBuf>,
 }
 
 /// Returns Err with a user-facing message if `mode` is not valid for `kind`.
@@ -81,17 +85,36 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         return 64;
     }
 
+    let model = args.model.unwrap_or_else(|| defaults.model.to_string());
+    let llm_log_file = resolve_llm_log_file(
+        &args.input,
+        args.enable_llm_log,
+        args.llm_log_file.as_ref(),
+        defaults.provider_name,
+        &model,
+    );
+
     let cfg = PresetConfig {
         base_url: args
             .base_url
             .unwrap_or_else(|| defaults.base_url.to_string()),
-        model: args.model.unwrap_or_else(|| defaults.model.to_string()),
+        model,
         api_key: args.api_key.or_else(|| env_api_key(defaults.api_key_env)),
         json_mode,
         context_size: args.context_size,
         verbose: args.verbose,
     };
     let output = args.output;
+    let llm_logger = match llm_log_file.as_deref() {
+        Some(path) => match LlmLogger::open(path) {
+            Ok(logger) => Some(logger),
+            Err(e) => {
+                eprintln!("humanify: failed to open LLM log: {e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
 
     let source = match pipe::read_input(&args.input) {
         Ok(s) => s,
@@ -111,7 +134,7 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
 
     let timeout =
         std::time::Duration::from_secs(args.timeout_seconds.unwrap_or(defaults.timeout_seconds));
-    let client = HttpClient::with_timeout(timeout);
+    let client = HttpClient::with_timeout_and_logger(timeout, llm_logger);
     let ladder = Arc::new(build_ladder(client, &cfg, defaults.provider_kind));
     let mut renamer = LlmRenamer::new(Arc::clone(&ladder), rt.handle().clone());
     let context_size = cfg.context_size;
@@ -274,6 +297,59 @@ impl JsonMode {
 /// Read an API key from the given env var. Returns `None` if unset or empty.
 pub fn env_api_key(var_name: &str) -> Option<String> {
     env::var(var_name).ok().filter(|s| !s.is_empty())
+}
+
+fn resolve_llm_log_file(
+    input: &str,
+    enable_llm_log: bool,
+    explicit_file: Option<&PathBuf>,
+    provider: &str,
+    model: &str,
+) -> Option<PathBuf> {
+    explicit_file
+        .cloned()
+        .or_else(|| enable_llm_log.then(|| default_llm_log_file(input, provider, model)))
+}
+
+pub fn default_llm_log_file(input: &str, provider: &str, model: &str) -> PathBuf {
+    let input_name = input_file_name(input);
+    let provider = sanitize_log_component(provider);
+    let model = sanitize_log_component(model);
+    PathBuf::from(format!("{input_name}-llm-{provider}-{model}.jsonl"))
+}
+
+fn input_file_name(input: &str) -> String {
+    if input == "-" {
+        return "stdin".to_string();
+    }
+
+    let name = std::path::Path::new(input)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(input);
+    sanitize_log_component(name)
+}
+
+fn sanitize_log_component(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_dash = false;
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            out.push(ch);
+            previous_dash = false;
+        } else if !previous_dash {
+            out.push('-');
+            previous_dash = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +577,8 @@ mod tests {
             json_mode: json_mode.to_string(),
             verbose: false,
             timeout_seconds: None,
+            enable_llm_log: false,
+            llm_log_file: None,
         }
     }
 
@@ -517,6 +595,58 @@ mod tests {
     fn unknown_json_mode_returns_64() {
         let code = run_preset(preset_args_no_io("garbage"), crate::cli::openai::DEFAULTS);
         assert_eq!(code, 64);
+    }
+
+    #[test]
+    fn preset_args_can_carry_llm_log_file_path() {
+        let mut args = preset_args_no_io("ladder");
+        args.llm_log_file = Some(PathBuf::from("llm.jsonl"));
+        assert_eq!(
+            args.llm_log_file.as_deref(),
+            Some(std::path::Path::new("llm.jsonl"))
+        );
+    }
+
+    #[test]
+    fn default_llm_log_file_uses_input_provider_and_sanitized_model() {
+        assert_eq!(
+            default_llm_log_file("fixtures/app.min.js", "openrouter", "qwen/qwen3-coder:free"),
+            PathBuf::from("app.min.js-llm-openrouter-qwen-qwen3-coder-free.jsonl")
+        );
+    }
+
+    #[test]
+    fn default_llm_log_file_uses_stdin_for_dash_input() {
+        assert_eq!(
+            default_llm_log_file("-", "ollama", "qwen3.5:4b"),
+            PathBuf::from("stdin-llm-ollama-qwen3.5-4b.jsonl")
+        );
+    }
+
+    #[test]
+    fn resolve_llm_log_file_prefers_explicit_file() {
+        let mut args = preset_args_no_io("ladder");
+        args.enable_llm_log = true;
+        args.llm_log_file = Some(PathBuf::from("custom.jsonl"));
+        let cfg = PresetConfig {
+            base_url: "http://localhost:11434/v1".to_string(),
+            model: "qwen3.5:4b".to_string(),
+            api_key: None,
+            json_mode: JsonMode::Ladder,
+            context_size: 500,
+            verbose: false,
+        };
+
+        assert_eq!(
+            resolve_llm_log_file(
+                &args.input,
+                args.enable_llm_log,
+                args.llm_log_file.as_ref(),
+                crate::cli::ollama::DEFAULTS.provider_name,
+                &cfg.model,
+            ),
+            Some(PathBuf::from("custom.jsonl"))
+        );
     }
 
     // --- Anthropic default ladder shape ---
