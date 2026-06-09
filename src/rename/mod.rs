@@ -1,4 +1,5 @@
 mod safe_name;
+pub mod inventory;
 pub mod plan;
 pub mod state;
 #[cfg(test)]

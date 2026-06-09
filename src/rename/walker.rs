@@ -202,7 +202,7 @@ where
 ///
 /// In oxc: `scoping.get_node_id(ancestor.scope_id())` gives the node that created the scope
 /// the ancestor lives in — that is the scope block node. We return its span.
-fn find_binding_ancestor_span(
+pub(crate) fn find_binding_ancestor_span(
     nodes: &AstNodes<'_>,
     scoping: &Scoping,
     _decl_node_id: NodeId,
@@ -229,7 +229,7 @@ fn find_binding_ancestor_span(
 
 /// Compute the context window slice from source, given the binding-ancestor span and the
 /// symbol's own span. Mirrors v1's `scopeToString` truncation rules.
-fn compute_context_window(
+pub(crate) fn compute_context_window(
     source: &str,
     sym_span: oxc_span::Span,
     ctx_span: oxc_span::Span,
