@@ -8,7 +8,7 @@ fn gemini_offline_identity() {
     let out = NamedTempFile::new().unwrap();
     let out_path = out.path().to_owned();
 
-    Command::cargo_bin("humanify")
+    let assert = Command::cargo_bin("humanify")
         .unwrap()
         .args([
             "gemini",
@@ -21,6 +21,12 @@ fn gemini_offline_identity() {
         .write_stdin("const x = 1;")
         .assert()
         .success();
+
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("humanify: renaming 1/1: x"),
+        "stderr: {stderr}"
+    );
 
     let contents = std::fs::read_to_string(&out_path).unwrap();
     assert_eq!(contents.trim(), "const x = 1;");

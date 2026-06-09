@@ -7,7 +7,7 @@ use crate::llm::{
     JsonStrategy, Ladder, LlmRenamer, OpenAIJsonSchema, PromptToJson, ToolCallAndPrompt,
 };
 use crate::pipe;
-use crate::rename::{rename_all_identifiers, RenameError};
+use crate::rename::{rename_all_identifiers_with_progress, RenameError};
 
 pub struct PresetConfig {
     pub base_url: String,
@@ -118,7 +118,12 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
 
     let result = rt.block_on(async move {
         tokio::task::spawn_blocking(move || {
-            rename_all_identifiers(&source, &mut renamer, context_size)
+            rename_all_identifiers_with_progress(&source, &mut renamer, context_size, |progress| {
+                eprintln!(
+                    "humanify: renaming {}/{}: {}",
+                    progress.current, progress.total, progress.original_name
+                );
+            })
         })
         .await
     });
