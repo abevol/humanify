@@ -25,3 +25,4 @@ pub trait JsonStrategy: Send + Sync {
     /// Human-readable name for logging / `--json-mode` flag matching.
     fn name(&self) -> &'static str;
 }
+pub mod batch;

@@ -1,4 +1,4 @@
-mod safe_name;
+pub(crate) mod safe_name;
 pub mod inventory;
 pub mod plan;
 pub mod rules;
