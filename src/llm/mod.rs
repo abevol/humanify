@@ -26,3 +26,4 @@ pub trait JsonStrategy: Send + Sync {
     fn name(&self) -> &'static str;
 }
 pub mod batch;
+pub mod jobs;

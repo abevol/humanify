@@ -180,7 +180,6 @@ fn estimate_tokens(item: &LlmBatchItem) -> usize {
     16 + (item.symbol_key.len() + item.original_name.len() + item.evidence.len()) / 4
 }
 
-#[cfg(test)]
 impl LlmBatchJob {
     pub fn for_test(keys: &[&str]) -> Self {
         Self {
