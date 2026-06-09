@@ -9,11 +9,30 @@ use oxc_str::Ident;
 
 use super::{RenameError, Renamer};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenameProgress<'a> {
+    pub current: usize,
+    pub total: usize,
+    pub original_name: &'a str,
+}
+
 pub fn rename_all_identifiers(
     source: &str,
     renamer: &mut dyn Renamer,
     context_size: usize,
 ) -> Result<String, RenameError> {
+    rename_all_identifiers_with_progress(source, renamer, context_size, |_| {})
+}
+
+pub fn rename_all_identifiers_with_progress<F>(
+    source: &str,
+    renamer: &mut dyn Renamer,
+    context_size: usize,
+    mut on_progress: F,
+) -> Result<String, RenameError>
+where
+    F: FnMut(RenameProgress<'_>),
+{
     if source.is_empty() {
         return Ok(String::new());
     }
@@ -71,11 +90,12 @@ pub fn rename_all_identifiers(
 
     // Sort: largest scope first; ties broken by source position (ascending).
     entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+    let total = entries.len();
 
     let mut visited: HashSet<SymbolId> = HashSet::new();
     let mut taken: HashSet<String> = HashSet::new();
 
-    for (sym_id, _, _) in &entries {
+    for (index, (sym_id, _, _)) in entries.iter().enumerate() {
         let sym_id = *sym_id;
         let original_name = {
             let scoping = semantic.scoping();
@@ -107,6 +127,12 @@ pub fn rename_all_identifiers(
             );
             compute_context_window(source, sym_span, ctx_span, context_size)
         };
+
+        on_progress(RenameProgress {
+            current: index + 1,
+            total,
+            original_name: &original_name,
+        });
 
         let new_name = renamer.rename(&original_name, &surrounding);
 
@@ -261,6 +287,52 @@ mod tests {
     fn no_op_returns_same_empty_code() {
         let out = rename_all_identifiers("", &mut super::super::test_dsl::identity(), 500).unwrap();
         assert_eq!(out, "");
+    }
+
+    #[test]
+    fn progress_reports_processed_identifiers_in_order() {
+        let mut events = Vec::new();
+        let output = rename_all_identifiers_with_progress(
+            "function f(a){ const b = a + 1; return b; }",
+            &mut identity(),
+            200,
+            |progress| {
+                events.push((
+                    progress.current,
+                    progress.total,
+                    progress.original_name.to_string(),
+                ));
+            },
+        )
+        .expect("rename_all_identifiers_with_progress failed");
+
+        assert!(output.contains("function f"), "output: {output}");
+        assert_eq!(events.len(), 3, "events: {events:?}");
+        assert_eq!(events[0].0, 1);
+        assert_eq!(events[0].1, 3);
+        assert_eq!(events[1].0, 2);
+        assert_eq!(events[1].1, 3);
+        assert_eq!(events[2].0, 3);
+        assert_eq!(events[2].1, 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|(_, _, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["f", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn progress_is_quiet_for_empty_source() {
+        let mut events = Vec::new();
+        let output = rename_all_identifiers_with_progress("", &mut identity(), 200, |progress| {
+            events.push(progress.current)
+        })
+        .expect("rename_all_identifiers_with_progress failed");
+
+        assert_eq!(output, "");
+        assert!(events.is_empty(), "events: {events:?}");
     }
 
     #[test]
