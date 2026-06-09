@@ -43,3 +43,13 @@ impl RenamePlan {
             .count()
     }
 }
+
+impl RenamePlanItem {
+    pub fn resolved_name(&self) -> Option<&str> {
+        match &self.state {
+            PlanItemState::Resolved { name, .. } => Some(name.as_str()),
+            PlanItemState::Keep { .. } => Some(self.original_name.as_str()),
+            _ => None,
+        }
+    }
+}
