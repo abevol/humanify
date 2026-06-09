@@ -26,6 +26,9 @@ pub struct Args {
     pub timeout_seconds: Option<u64>,
     pub enable_llm_log: bool,
     pub llm_log_file: Option<PathBuf>,
+    pub log_file: Option<PathBuf>,
+    pub no_log_file: bool,
+    pub quiet_log: bool,
 }
 
 impl From<Args> for PresetArgs {
@@ -42,6 +45,9 @@ impl From<Args> for PresetArgs {
             timeout_seconds: a.timeout_seconds,
             enable_llm_log: a.enable_llm_log,
             llm_log_file: a.llm_log_file,
+            log_file: a.log_file,
+            no_log_file: a.no_log_file,
+            quiet_log: a.quiet_log,
         }
     }
 }

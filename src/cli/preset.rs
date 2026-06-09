@@ -2,13 +2,14 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::cli::app_log::{AppLogger, RunTimer, StderrMode};
 use crate::llm::log::LlmLogger;
 use crate::llm::{
     http::HttpClient, AnthropicNativeJsonSchema, AnthropicToolCallAndPrompt, ForcedToolCall,
     JsonStrategy, Ladder, LlmRenamer, OpenAIJsonSchema, PromptToJson, ToolCallAndPrompt,
 };
 use crate::pipe;
-use crate::rename::{rename_all_identifiers_with_progress, RenameError};
+use crate::rename::{rename_all_identifiers_with_progress, RenameError, RenameProgressPhase};
 
 pub struct PresetConfig {
     pub base_url: String,
@@ -51,6 +52,9 @@ pub struct PresetArgs {
     pub timeout_seconds: Option<u64>,
     pub enable_llm_log: bool,
     pub llm_log_file: Option<PathBuf>,
+    pub log_file: Option<PathBuf>,
+    pub no_log_file: bool,
+    pub quiet_log: bool,
 }
 
 /// Returns Err with a user-facing message if `mode` is not valid for `kind`.
@@ -72,16 +76,28 @@ pub fn validate_json_mode_for_provider(mode: &JsonMode, kind: ProviderKind) -> R
 
 /// Drives the full pipeline for any preset. Returns process exit code (0 / 1 / 2 / 64).
 pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
+    let timer = RunTimer::start();
+    let app_log_path = resolve_app_log_file(args.no_log_file, args.log_file.as_ref());
+    let app_logger = match AppLogger::open(app_log_path.as_deref(), stderr_mode(args.quiet_log)) {
+        Ok(logger) => logger,
+        Err(e) => {
+            eprintln!("humanify: failed to open program log: {e}");
+            return 1;
+        }
+    };
+
     let json_mode = match JsonMode::parse(&args.json_mode) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("humanify: {e}");
+            log_error_and_finish(&app_logger, &timer, "argument_error", &e, 64);
             return 64;
         }
     };
 
     if let Err(msg) = validate_json_mode_for_provider(&json_mode, defaults.provider_kind) {
         eprintln!("humanify: {msg}");
+        log_error_and_finish(&app_logger, &timer, "argument_error", &msg, 64);
         return 64;
     }
 
@@ -92,6 +108,24 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         args.llm_log_file.as_ref(),
         defaults.provider_name,
         &model,
+    );
+    let timeout_seconds = args.timeout_seconds.unwrap_or(defaults.timeout_seconds);
+    let output = args.output;
+    let base_url_source = option_source(args.base_url.as_ref());
+
+    app_logger.info(
+        "start",
+        [
+            ("provider", defaults.provider_name),
+            ("input", args.input.as_str()),
+            ("output", output_label(output.as_ref()).as_str()),
+            ("model", model.as_str()),
+            ("base_url_source", base_url_source),
+            ("json_mode", json_mode.as_str()),
+            ("context_size", args.context_size.to_string().as_str()),
+            ("timeout_seconds", timeout_seconds.to_string().as_str()),
+            ("llm_log", on_off(llm_log_file.is_some())),
+        ],
     );
 
     let cfg = PresetConfig {
@@ -104,12 +138,12 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         context_size: args.context_size,
         verbose: args.verbose,
     };
-    let output = args.output;
     let llm_logger = match llm_log_file.as_deref() {
         Some(path) => match LlmLogger::open(path) {
             Ok(logger) => Some(logger),
             Err(e) => {
                 eprintln!("humanify: failed to open LLM log: {e}");
+                log_error_and_finish(&app_logger, &timer, "llm_log_open_error", &e.to_string(), 1);
                 return 1;
             }
         },
@@ -120,32 +154,66 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         Ok(s) => s,
         Err(e) => {
             eprintln!("humanify: failed to read input: {e}");
+            log_error_and_finish(&app_logger, &timer, "input_read_error", &e.to_string(), 1);
             return 1;
         }
     };
+    app_logger.info("input_read", [("bytes", source.len().to_string().as_str())]);
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("humanify: failed to create tokio runtime: {e}");
+            log_error_and_finish(&app_logger, &timer, "runtime_error", &e.to_string(), 1);
             return 1;
         }
     };
 
-    let timeout =
-        std::time::Duration::from_secs(args.timeout_seconds.unwrap_or(defaults.timeout_seconds));
+    let timeout = std::time::Duration::from_secs(timeout_seconds);
     let client = HttpClient::with_timeout_and_logger(timeout, llm_logger);
     let ladder = Arc::new(build_ladder(client, &cfg, defaults.provider_kind));
     let mut renamer = LlmRenamer::new(Arc::clone(&ladder), rt.handle().clone());
     let context_size = cfg.context_size;
+    let progress_logger = app_logger.clone();
+    let mut progress_timer = timer.clone();
 
     let result = rt.block_on(async move {
         tokio::task::spawn_blocking(move || {
             rename_all_identifiers_with_progress(&source, &mut renamer, context_size, |progress| {
-                eprintln!(
-                    "humanify: renaming {}/{}: {}",
-                    progress.current, progress.total, progress.original_name
-                );
+                match progress.phase {
+                    RenameProgressPhase::Start => {
+                        eprintln!(
+                            "humanify: renaming {}/{}: {}",
+                            progress.current, progress.total, progress.original_name
+                        );
+                        progress_logger.info(
+                            "progress_start",
+                            [
+                                ("step", progress.current.to_string().as_str()),
+                                ("total", progress.total.to_string().as_str()),
+                                ("original_name", progress.original_name),
+                                ("elapsed_ms", progress_timer.elapsed_ms().as_str()),
+                            ],
+                        );
+                    }
+                    RenameProgressPhase::Finish => {
+                        let (step_ms, elapsed_ms) = progress_timer.step_ms_and_elapsed_ms();
+                        progress_logger.info(
+                            "progress_finish",
+                            [
+                                ("step", progress.current.to_string().as_str()),
+                                ("total", progress.total.to_string().as_str()),
+                                ("original_name", progress.original_name),
+                                (
+                                    "new_name",
+                                    progress.new_name.unwrap_or(progress.original_name),
+                                ),
+                                ("elapsed_ms", elapsed_ms.as_str()),
+                                ("step_ms", step_ms.as_str()),
+                            ],
+                        );
+                    }
+                }
             })
         })
         .await
@@ -155,10 +223,18 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         Ok(Ok(s)) => s,
         Ok(Err(RenameError::Parse(msg))) => {
             eprintln!("humanify: parse error: {msg}");
+            log_error_and_finish(&app_logger, &timer, "parse_error", &msg, 2);
             return 2;
         }
         Err(join_err) => {
             eprintln!("humanify: internal error: {join_err}");
+            log_error_and_finish(
+                &app_logger,
+                &timer,
+                "internal_error",
+                &join_err.to_string(),
+                1,
+            );
             return 1;
         }
     };
@@ -166,14 +242,87 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
     if cfg.verbose {
         let locked = ladder.locked_strategy_name().unwrap_or("none");
         eprintln!("humanify: locked strategy: {locked}");
+        app_logger.info("strategy", [("locked", locked)]);
     }
 
     if let Err(e) = pipe::write_output(output.as_deref(), &renamed) {
         eprintln!("humanify: failed to write output: {e}");
+        log_error_and_finish(&app_logger, &timer, "output_write_error", &e.to_string(), 1);
         return 1;
     }
 
+    app_logger.info(
+        "output_write",
+        [
+            ("target", output_label(output.as_ref()).as_str()),
+            ("bytes", renamed.len().to_string().as_str()),
+        ],
+    );
+    log_finish(&app_logger, &timer, 0);
     0
+}
+
+fn resolve_app_log_file(no_log_file: bool, explicit_file: Option<&PathBuf>) -> Option<PathBuf> {
+    if no_log_file {
+        None
+    } else {
+        Some(
+            explicit_file
+                .cloned()
+                .unwrap_or_else(|| AppLogger::default_log_file().to_path_buf()),
+        )
+    }
+}
+
+fn stderr_mode(quiet_log: bool) -> StderrMode {
+    if quiet_log {
+        StderrMode::ErrorsOnly
+    } else {
+        StderrMode::All
+    }
+}
+
+fn option_source<T>(value: Option<&T>) -> &'static str {
+    if value.is_some() {
+        "custom"
+    } else {
+        "default"
+    }
+}
+
+fn output_label(output: Option<&PathBuf>) -> String {
+    output
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "stdout".to_string())
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+fn log_error_and_finish(
+    logger: &AppLogger,
+    timer: &RunTimer,
+    event: &str,
+    message: &str,
+    exit_code: i32,
+) {
+    logger.error(event, [("message", message)]);
+    log_finish(logger, timer, exit_code);
+}
+
+fn log_finish(logger: &AppLogger, timer: &RunTimer, exit_code: i32) {
+    logger.info(
+        "finish",
+        [
+            ("exit_code", exit_code.to_string().as_str()),
+            ("elapsed_ms", timer.elapsed_ms().as_str()),
+        ],
+    );
 }
 
 fn build_ladder(client: HttpClient, cfg: &PresetConfig, kind: ProviderKind) -> Ladder {
@@ -579,6 +728,9 @@ mod tests {
             timeout_seconds: None,
             enable_llm_log: false,
             llm_log_file: None,
+            log_file: None,
+            no_log_file: true,
+            quiet_log: false,
         }
     }
 
