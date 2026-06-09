@@ -115,7 +115,9 @@ mod tests {
             "scripted",
             vec![
                 ScriptedResponse::Transient("offline".to_string()),
-                ScriptedResponse::Ok(serde_json::json!({"renames":[{"symbol_key":"s1","name":"goodName","confidence":90}]})),
+                ScriptedResponse::Ok(
+                    serde_json::json!({"renames":[{"symbol_key":"s1","name":"goodName","confidence":90}]}),
+                ),
             ],
         );
         let runner = JobRunner::for_test(

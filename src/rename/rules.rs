@@ -42,10 +42,16 @@ fn classify_entry(
     if entry.original_name == "n" && entry.context.contains("t[n-1]+t[n-2]") {
         return resolved("fibIndex", "fibonacci-index-rule", 85);
     }
-    if entry.original_name == "e" && entry.context.contains("e.length") && entry.context.contains("t+=e[n]") {
+    if entry.original_name == "e"
+        && entry.context.contains("e.length")
+        && entry.context.contains("t+=e[n]")
+    {
         return resolved("values", "sum-values-parameter-rule", 90);
     }
-    if entry.original_name == "t" && entry.context.contains("var t=0") && entry.context.contains("t+=") {
+    if entry.original_name == "t"
+        && entry.context.contains("var t=0")
+        && entry.context.contains("t+=")
+    {
         return resolved("sum", "sum-accumulator-rule", 95);
     }
     if entry.original_name == "n" && entry.context.contains("for(var n=0") {

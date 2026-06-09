@@ -30,7 +30,9 @@ pub fn build_symbol_inventory(
     context_size: usize,
 ) -> Result<SymbolInventory, RenameError> {
     if source.is_empty() {
-        return Ok(SymbolInventory { entries: Vec::new() });
+        return Ok(SymbolInventory {
+            entries: Vec::new(),
+        });
     }
 
     let allocator = Allocator::default();
@@ -137,7 +139,10 @@ mod tests {
         assert!(names.contains(&"t"), "names: {names:?}");
         assert!(names.contains(&"n"), "names: {names:?}");
         assert!(names.contains(&"c"), "names: {names:?}");
-        assert!(inventory.entries.iter().all(|entry| !entry.key.0.is_empty()));
+        assert!(inventory
+            .entries
+            .iter()
+            .all(|entry| !entry.key.0.is_empty()));
     }
 
     #[test]

@@ -1,5 +1,5 @@
-use std::env;
 use std::collections::VecDeque;
+use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -11,10 +11,12 @@ use crate::llm::{
 };
 use crate::pipe;
 use crate::rename::inventory::build_symbol_inventory;
-use crate::rename::rules::plan_deterministic_renames;
-use crate::rename::{rename_all_identifiers_with_progress, RenameError, RenameProgressPhase, Renamer};
 use crate::rename::plan::PlanItemState;
+use crate::rename::rules::plan_deterministic_renames;
 use crate::rename::state::load_state;
+use crate::rename::{
+    rename_all_identifiers_with_progress, RenameError, RenameProgressPhase, Renamer,
+};
 
 pub struct PresetConfig {
     pub base_url: String,
@@ -179,30 +181,45 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
                 log_error_and_finish(&app_logger, &timer, "parse_error", &msg, 2);
                 return 2;
             }
-        }; if let Err(e) = pipe::write_output(output.as_deref(), &renamed) {
-            eprintln!("humanify: failed to write output: {e}");
-            log_error_and_finish(&app_logger, &timer, "output_write_error", &e.to_string(), 1);
-            return 1;
-        }
-        app_logger.info("output_write", [("target", output_label(output.as_ref()).as_str()), ("bytes", renamed.len().to_string().as_str())]);
-        log_finish(&app_logger, &timer, 0);
-        return 0;
-    }
-
-    if let Some(renamed) = match try_deterministic_rename_complete(&source, cfg.context_size, &app_logger) {
-        Ok(value) => value,
-        Err(RenameError::Parse(msg)) => {
-            eprintln!("humanify: parse error: {msg}");
-            log_error_and_finish(&app_logger, &timer, "parse_error", &msg, 2);
-            return 2;
-        }
-    } {
+        };
         if let Err(e) = pipe::write_output(output.as_deref(), &renamed) {
             eprintln!("humanify: failed to write output: {e}");
             log_error_and_finish(&app_logger, &timer, "output_write_error", &e.to_string(), 1);
             return 1;
         }
-        app_logger.info("output_write", [("target", output_label(output.as_ref()).as_str()), ("bytes", renamed.len().to_string().as_str())]);
+        app_logger.info(
+            "output_write",
+            [
+                ("target", output_label(output.as_ref()).as_str()),
+                ("bytes", renamed.len().to_string().as_str()),
+            ],
+        );
+        log_finish(&app_logger, &timer, 0);
+        return 0;
+    }
+
+    if let Some(renamed) =
+        match try_deterministic_rename_complete(&source, cfg.context_size, &app_logger) {
+            Ok(value) => value,
+            Err(RenameError::Parse(msg)) => {
+                eprintln!("humanify: parse error: {msg}");
+                log_error_and_finish(&app_logger, &timer, "parse_error", &msg, 2);
+                return 2;
+            }
+        }
+    {
+        if let Err(e) = pipe::write_output(output.as_deref(), &renamed) {
+            eprintln!("humanify: failed to write output: {e}");
+            log_error_and_finish(&app_logger, &timer, "output_write_error", &e.to_string(), 1);
+            return 1;
+        }
+        app_logger.info(
+            "output_write",
+            [
+                ("target", output_label(output.as_ref()).as_str()),
+                ("bytes", renamed.len().to_string().as_str()),
+            ],
+        );
         log_finish(&app_logger, &timer, 0);
         return 0;
     }
@@ -899,12 +916,27 @@ fn run_deterministic_rename_only(
     context_size: usize,
     app_logger: &AppLogger,
 ) -> Result<String, RenameError> {
-    app_logger.info("inventory_start", [("context_size", context_size.to_string().as_str())]);
+    app_logger.info(
+        "inventory_start",
+        [("context_size", context_size.to_string().as_str())],
+    );
     let inventory = build_symbol_inventory(source, context_size)?;
-    app_logger.info("inventory_finish", [("symbols", inventory.entries.len().to_string().as_str())]);
+    app_logger.info(
+        "inventory_finish",
+        [("symbols", inventory.entries.len().to_string().as_str())],
+    );
     let plan = plan_deterministic_renames(&inventory);
     let needs_llm = plan.needs_llm_count();
-    app_logger.info("planner_finish", [("resolved", (plan.items.len() - needs_llm).to_string().as_str()), ("needs_llm", needs_llm.to_string().as_str())]);
+    app_logger.info(
+        "planner_finish",
+        [
+            (
+                "resolved",
+                (plan.items.len() - needs_llm).to_string().as_str(),
+            ),
+            ("needs_llm", needs_llm.to_string().as_str()),
+        ],
+    );
     if needs_llm > 0 {
         eprintln!("humanify: paused because {needs_llm} symbols still require LLM");
         return Ok(source.to_string());
@@ -915,12 +947,17 @@ fn run_deterministic_rename_only(
         .map(|item| match &item.state {
             PlanItemState::Resolved { name, .. } => name.clone(),
             PlanItemState::Keep { .. } => item.original_name.clone(),
-            PlanItemState::NeedsLlm { .. } | PlanItemState::Failed { .. } => item.original_name.clone(),
+            PlanItemState::NeedsLlm { .. } | PlanItemState::Failed { .. } => {
+                item.original_name.clone()
+            }
         })
         .collect::<VecDeque<_>>();
     let mut renamer = QueuePlanRenamer { names };
     let renamed = rename_all_identifiers_with_progress(source, &mut renamer, context_size, |_| {})?;
-    app_logger.info("apply_finish", [("symbols", plan.items.len().to_string().as_str())]);
+    app_logger.info(
+        "apply_finish",
+        [("symbols", plan.items.len().to_string().as_str())],
+    );
     Ok(renamed)
 }
 
@@ -933,7 +970,16 @@ fn try_deterministic_rename_complete(
     let plan = plan_deterministic_renames(&inventory);
     let needs_llm = plan.needs_llm_count();
     if needs_llm > 0 {
-        app_logger.info("planner_finish", [("resolved", (plan.items.len() - needs_llm).to_string().as_str()), ("needs_llm", needs_llm.to_string().as_str())]);
+        app_logger.info(
+            "planner_finish",
+            [
+                (
+                    "resolved",
+                    (plan.items.len() - needs_llm).to_string().as_str(),
+                ),
+                ("needs_llm", needs_llm.to_string().as_str()),
+            ],
+        );
         return Ok(None);
     }
     let names = plan
@@ -942,13 +988,24 @@ fn try_deterministic_rename_complete(
         .map(|item| match &item.state {
             PlanItemState::Resolved { name, .. } => name.clone(),
             PlanItemState::Keep { .. } => item.original_name.clone(),
-            PlanItemState::NeedsLlm { .. } | PlanItemState::Failed { .. } => item.original_name.clone(),
+            PlanItemState::NeedsLlm { .. } | PlanItemState::Failed { .. } => {
+                item.original_name.clone()
+            }
         })
         .collect::<VecDeque<_>>();
     let mut renamer = QueuePlanRenamer { names };
     let renamed = rename_all_identifiers_with_progress(source, &mut renamer, context_size, |_| {})?;
-    app_logger.info("planner_finish", [("resolved", plan.items.len().to_string().as_str()), ("needs_llm", "0")]);
-    app_logger.info("apply_finish", [("symbols", plan.items.len().to_string().as_str())]);
+    app_logger.info(
+        "planner_finish",
+        [
+            ("resolved", plan.items.len().to_string().as_str()),
+            ("needs_llm", "0"),
+        ],
+    );
+    app_logger.info(
+        "apply_finish",
+        [("symbols", plan.items.len().to_string().as_str())],
+    );
     Ok(Some(renamed))
 }
 
