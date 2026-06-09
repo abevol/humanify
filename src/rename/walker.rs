@@ -14,6 +14,14 @@ pub struct RenameProgress<'a> {
     pub current: usize,
     pub total: usize,
     pub original_name: &'a str,
+    pub new_name: Option<&'a str>,
+    pub phase: RenameProgressPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameProgressPhase {
+    Start,
+    Finish,
 }
 
 pub fn rename_all_identifiers(
@@ -132,9 +140,19 @@ where
             current: index + 1,
             total,
             original_name: &original_name,
+            new_name: None,
+            phase: RenameProgressPhase::Start,
         });
 
         let new_name = renamer.rename(&original_name, &surrounding);
+
+        on_progress(RenameProgress {
+            current: index + 1,
+            total,
+            original_name: &original_name,
+            new_name: Some(&new_name),
+            phase: RenameProgressPhase::Finish,
+        });
 
         if new_name == original_name {
             // No rename; short-circuit — skip safe-name pipeline.
@@ -301,23 +319,37 @@ mod tests {
                     progress.current,
                     progress.total,
                     progress.original_name.to_string(),
+                    progress.phase,
                 ));
             },
         )
         .expect("rename_all_identifiers_with_progress failed");
 
         assert!(output.contains("function f"), "output: {output}");
-        assert_eq!(events.len(), 3, "events: {events:?}");
+        assert_eq!(events.len(), 6, "events: {events:?}");
         assert_eq!(events[0].0, 1);
         assert_eq!(events[0].1, 3);
-        assert_eq!(events[1].0, 2);
+        assert_eq!(events[0].3, RenameProgressPhase::Start);
+        assert_eq!(events[1].0, 1);
         assert_eq!(events[1].1, 3);
-        assert_eq!(events[2].0, 3);
+        assert_eq!(events[1].3, RenameProgressPhase::Finish);
+        assert_eq!(events[2].0, 2);
         assert_eq!(events[2].1, 3);
+        assert_eq!(events[2].3, RenameProgressPhase::Start);
+        assert_eq!(events[3].0, 2);
+        assert_eq!(events[3].1, 3);
+        assert_eq!(events[3].3, RenameProgressPhase::Finish);
+        assert_eq!(events[4].0, 3);
+        assert_eq!(events[4].1, 3);
+        assert_eq!(events[4].3, RenameProgressPhase::Start);
+        assert_eq!(events[5].0, 3);
+        assert_eq!(events[5].1, 3);
+        assert_eq!(events[5].3, RenameProgressPhase::Finish);
         assert_eq!(
             events
                 .iter()
-                .map(|(_, _, name)| name.as_str())
+                .filter(|(_, _, _, phase)| *phase == RenameProgressPhase::Start)
+                .map(|(_, _, name, _)| name.as_str())
                 .collect::<Vec<_>>(),
             vec!["f", "a", "b"]
         );

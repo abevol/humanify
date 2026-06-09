@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod app_log;
 pub mod gemini;
 pub mod ollama;
 pub mod openai;

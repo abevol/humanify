@@ -66,6 +66,18 @@ struct SubArgs {
     #[arg(long)]
     llm_log_file: Option<PathBuf>,
 
+    /// Append program run logs to this file (default: humanify.log)
+    #[arg(long)]
+    log_file: Option<PathBuf>,
+
+    /// Disable program log file output
+    #[arg(long)]
+    no_log_file: bool,
+
+    /// Only write program errors to stderr; file logging remains detailed
+    #[arg(long)]
+    quiet_log: bool,
+
     /// Debug log to stderr
     #[arg(short, long)]
     verbose: bool,
@@ -84,6 +96,9 @@ fn into_openai_args(a: SubArgs) -> openai::Args {
         timeout_seconds: a.timeout_seconds,
         enable_llm_log: a.enable_llm_log,
         llm_log_file: a.llm_log_file,
+        log_file: a.log_file,
+        no_log_file: a.no_log_file,
+        quiet_log: a.quiet_log,
     }
 }
 
@@ -100,6 +115,9 @@ fn into_gemini_args(a: SubArgs) -> gemini::Args {
         timeout_seconds: a.timeout_seconds,
         enable_llm_log: a.enable_llm_log,
         llm_log_file: a.llm_log_file,
+        log_file: a.log_file,
+        no_log_file: a.no_log_file,
+        quiet_log: a.quiet_log,
     }
 }
 
@@ -116,6 +134,9 @@ fn into_anthropic_args(a: SubArgs) -> anthropic::Args {
         timeout_seconds: a.timeout_seconds,
         enable_llm_log: a.enable_llm_log,
         llm_log_file: a.llm_log_file,
+        log_file: a.log_file,
+        no_log_file: a.no_log_file,
+        quiet_log: a.quiet_log,
     }
 }
 
@@ -132,6 +153,9 @@ fn into_ollama_args(a: SubArgs) -> ollama::Args {
         timeout_seconds: a.timeout_seconds,
         enable_llm_log: a.enable_llm_log,
         llm_log_file: a.llm_log_file,
+        log_file: a.log_file,
+        no_log_file: a.no_log_file,
+        quiet_log: a.quiet_log,
     }
 }
 
@@ -148,6 +172,9 @@ fn into_openrouter_args(a: SubArgs) -> openrouter::Args {
         timeout_seconds: a.timeout_seconds,
         enable_llm_log: a.enable_llm_log,
         llm_log_file: a.llm_log_file,
+        log_file: a.log_file,
+        no_log_file: a.no_log_file,
+        quiet_log: a.quiet_log,
     }
 }
 
