@@ -68,9 +68,9 @@ impl JobRunner {
                     "items": {
                         "type": "object",
                         "additionalProperties": false,
-                        "required": ["symbol_key", "name", "confidence"],
+                        "required": ["id", "name", "confidence"],
                         "properties": {
-                            "symbol_key": { "type": "string" },
+                            "id": { "type": "integer", "minimum": 0 },
                             "name": { "type": "string", "minLength": 1, "maxLength": 64 },
                             "confidence": { "type": "integer", "minimum": 0, "maximum": 100 }
                         }
@@ -78,7 +78,7 @@ impl JobRunner {
                 }
             }
         });
-        let user = serde_json::to_string(job)?;
+        let user = serde_json::to_string(&job.prompt_payload())?;
         let response = self
             .strategy
             .call(BATCH_SYSTEM_PROMPT, &user, &schema)
@@ -116,7 +116,7 @@ mod tests {
             vec![
                 ScriptedResponse::Transient("offline".to_string()),
                 ScriptedResponse::Ok(
-                    serde_json::json!({"renames":[{"symbol_key":"s1","name":"goodName","confidence":90}]}),
+                    serde_json::json!({"renames":[{"id":0,"name":"goodName","confidence":90}]}),
                 ),
             ],
         );

@@ -955,64 +955,55 @@ fn run_batched_plan_rename(
                     ("symbols", job.items.len().to_string().as_str()),
                 ],
             );
-            loop {
-                save_state_checkpoint(
-                    args,
-                    output,
-                    source,
-                    "llm_attempt",
-                    plan.clone(),
-                    retry_policy.clone(),
-                    app_logger,
-                );
-                let validated = match rt.block_on(runner.run_job_once(&job)) {
-                    Ok(validated) => validated,
-                    Err(err) => {
-                        increment_attempts_for_job(&mut plan, &job);
-                        save_state_checkpoint(
-                            args,
-                            output,
-                            source,
-                            "llm_progress",
-                            plan.clone(),
-                            retry_policy.clone(),
-                            app_logger,
-                        );
-                        if job_max_attempts(&plan, &job) < retry_policy.max_attempts.max(1) {
-                            continue;
-                        }
-                        eprintln!("humanify: paused after LLM job failure: {err}");
-                        save_state_checkpoint(
-                            args,
-                            output,
-                            source,
-                            "paused",
-                            plan,
-                            retry_policy,
-                            app_logger,
-                        );
-                        app_logger.error("paused", [("message", err.to_string().as_str())]);
-                        return Ok(DeterministicRun::Paused);
+            save_state_checkpoint(
+                args,
+                output,
+                source,
+                "llm_attempt",
+                plan.clone(),
+                retry_policy.clone(),
+                app_logger,
+            );
+            let validated = match rt.block_on(runner.run_job_once(&job)) {
+                Ok(validated) => validated,
+                Err(err) => {
+                    increment_attempts_for_job(&mut plan, &job);
+                    save_state_checkpoint(
+                        args,
+                        output,
+                        source,
+                        "llm_progress",
+                        plan.clone(),
+                        retry_policy.clone(),
+                        app_logger,
+                    );
+                    if job_max_attempts(&plan, &job) < retry_policy.max_attempts.max(1) {
+                        continue;
                     }
-                };
-                let had_rejections = !validated.rejected.is_empty();
-                apply_batch_results(&mut plan, validated.accepted, validated.rejected);
-                save_state_checkpoint(
-                    args,
-                    output,
-                    source,
-                    "llm_progress",
-                    plan.clone(),
-                    retry_policy.clone(),
-                    app_logger,
-                );
-                if had_rejections
-                    && job_max_attempts(&plan, &job) < retry_policy.max_attempts.max(1)
-                {
-                    continue;
+                    eprintln!("humanify: paused after LLM job failure: {err}");
+                    save_state_checkpoint(
+                        args,
+                        output,
+                        source,
+                        "paused",
+                        plan,
+                        retry_policy,
+                        app_logger,
+                    );
+                    app_logger.error("paused", [("message", err.to_string().as_str())]);
+                    return Ok(DeterministicRun::Paused);
                 }
-                break;
-            }
+            };
+            apply_batch_results(&mut plan, validated.accepted, validated.rejected);
+            save_state_checkpoint(
+                args,
+                output,
+                source,
+                "llm_progress",
+                plan.clone(),
+                retry_policy.clone(),
+                app_logger,
+            );
         }
         if unresolved_attempt_total(&plan) == attempts_before_round {
             break;
@@ -1202,7 +1193,7 @@ fn apply_batch_results(
         {
             if let PlanItemState::NeedsLlm { evidence, attempts } = &item.state {
                 item.state = PlanItemState::NeedsLlm {
-                    evidence: format!("{}\nPrevious rejection: {}", evidence, rejected.reason),
+                    evidence: evidence.clone(),
                     attempts: attempts + 1,
                 };
             }
