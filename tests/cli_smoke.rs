@@ -183,3 +183,27 @@ fn resume_rejects_missing_state_file() {
     cmd.args(["resume", "missing-state.json"]);
     cmd.assert().failure();
 }
+
+#[test]
+fn ollama_sample_uses_deterministic_plan_before_llm() {
+    let dir = tempdir().unwrap();
+    let input = dir.path().join("input.js");
+    let output = dir.path().join("out.js");
+    std::fs::write(&input, "function a(e){var t=[0,1];if(e<=2)return t.slice(0,e);while(t.length<e){var n=t.length;t.push(t[n-1]+t[n-2])}return t}function b(e){var t=0;for(var n=0;n<e.length;n++){t+=e[n]}return t}var c=a(10);var d=b(c);console.log(c,d);").unwrap();
+
+    Command::cargo_bin("humanify")
+        .unwrap()
+        .args([
+            "ollama",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--base-url",
+            "http://127.0.0.1:1",
+        ])
+        .assert()
+        .success();
+    let renamed = std::fs::read_to_string(output).unwrap();
+    assert!(renamed.contains("generateFibonacciSequence"), "{renamed}");
+    assert!(renamed.contains("sumValues"), "{renamed}");
+}

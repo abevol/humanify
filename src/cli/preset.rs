@@ -189,6 +189,24 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         return 0;
     }
 
+    if let Some(renamed) = match try_deterministic_rename_complete(&source, cfg.context_size, &app_logger) {
+        Ok(value) => value,
+        Err(RenameError::Parse(msg)) => {
+            eprintln!("humanify: parse error: {msg}");
+            log_error_and_finish(&app_logger, &timer, "parse_error", &msg, 2);
+            return 2;
+        }
+    } {
+        if let Err(e) = pipe::write_output(output.as_deref(), &renamed) {
+            eprintln!("humanify: failed to write output: {e}");
+            log_error_and_finish(&app_logger, &timer, "output_write_error", &e.to_string(), 1);
+            return 1;
+        }
+        app_logger.info("output_write", [("target", output_label(output.as_ref()).as_str()), ("bytes", renamed.len().to_string().as_str())]);
+        log_finish(&app_logger, &timer, 0);
+        return 0;
+    }
+
     let rt = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
         Err(e) => {
@@ -904,6 +922,34 @@ fn run_deterministic_rename_only(
     let renamed = rename_all_identifiers_with_progress(source, &mut renamer, context_size, |_| {})?;
     app_logger.info("apply_finish", [("symbols", plan.items.len().to_string().as_str())]);
     Ok(renamed)
+}
+
+fn try_deterministic_rename_complete(
+    source: &str,
+    context_size: usize,
+    app_logger: &AppLogger,
+) -> Result<Option<String>, RenameError> {
+    let inventory = build_symbol_inventory(source, context_size)?;
+    let plan = plan_deterministic_renames(&inventory);
+    let needs_llm = plan.needs_llm_count();
+    if needs_llm > 0 {
+        app_logger.info("planner_finish", [("resolved", (plan.items.len() - needs_llm).to_string().as_str()), ("needs_llm", needs_llm.to_string().as_str())]);
+        return Ok(None);
+    }
+    let names = plan
+        .items
+        .iter()
+        .map(|item| match &item.state {
+            PlanItemState::Resolved { name, .. } => name.clone(),
+            PlanItemState::Keep { .. } => item.original_name.clone(),
+            PlanItemState::NeedsLlm { .. } | PlanItemState::Failed { .. } => item.original_name.clone(),
+        })
+        .collect::<VecDeque<_>>();
+    let mut renamer = QueuePlanRenamer { names };
+    let renamed = rename_all_identifiers_with_progress(source, &mut renamer, context_size, |_| {})?;
+    app_logger.info("planner_finish", [("resolved", plan.items.len().to_string().as_str()), ("needs_llm", "0")]);
+    app_logger.info("apply_finish", [("symbols", plan.items.len().to_string().as_str())]);
+    Ok(Some(renamed))
 }
 
 struct QueuePlanRenamer {
