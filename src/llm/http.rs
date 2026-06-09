@@ -2,9 +2,12 @@ use anyhow::anyhow;
 use serde_json::Value;
 use std::time::Duration;
 
+use crate::llm::log::{unix_timestamp_ms, LlmLogEvent, LlmLogResponse, LlmLogger};
+
 #[derive(Clone)]
 pub struct HttpClient {
     inner: reqwest::Client,
+    logger: Option<LlmLogger>,
 }
 
 impl HttpClient {
@@ -13,11 +16,29 @@ impl HttpClient {
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
+        Self::with_timeout_and_logger(timeout, None)
+    }
+
+    pub fn with_timeout_and_logger(timeout: Duration, logger: Option<LlmLogger>) -> Self {
         let inner = reqwest::Client::builder()
             .timeout(timeout)
             .build()
             .expect("reqwest client init failed");
-        Self { inner }
+        Self { inner, logger }
+    }
+
+    #[cfg(test)]
+    pub fn has_logger(&self) -> bool {
+        self.logger.is_some()
+    }
+
+    fn log_event(&self, event: LlmLogEvent) -> Result<(), StrategyError> {
+        if let Some(logger) = &self.logger {
+            logger
+                .log(&event)
+                .map_err(|e| StrategyError::Transient(anyhow!("failed to write LLM log: {e}")))?;
+        }
+        Ok(())
     }
 
     pub async fn post_json(
@@ -43,23 +64,75 @@ impl HttpClient {
 
         request = request.json(body);
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| StrategyError::Transient(anyhow!(e)))?;
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(e) => {
+                let error = e.to_string();
+                self.log_event(LlmLogEvent {
+                    timestamp_ms: unix_timestamp_ms(),
+                    url: url.to_string(),
+                    request: body.clone(),
+                    response: None,
+                    error: Some(error.clone()),
+                })?;
+                return Err(StrategyError::Transient(anyhow!(error)));
+            }
+        };
 
         let status = response.status().as_u16();
-        let body_text = response
-            .text()
-            .await
-            .map_err(|e| StrategyError::Transient(anyhow!(e)))?;
+        let body_text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                let error = e.to_string();
+                self.log_event(LlmLogEvent {
+                    timestamp_ms: unix_timestamp_ms(),
+                    url: url.to_string(),
+                    request: body.clone(),
+                    response: None,
+                    error: Some(error.clone()),
+                })?;
+                return Err(StrategyError::Transient(anyhow!(error)));
+            }
+        };
 
         if (200..300).contains(&status) {
-            let value: Value = serde_json::from_str(&body_text).map_err(|e| {
-                StrategyError::Transient(anyhow!("response was not valid JSON: {e}"))
+            let value: Value = match serde_json::from_str(&body_text) {
+                Ok(value) => value,
+                Err(e) => {
+                    let error = format!("response was not valid JSON: {e}");
+                    self.log_event(LlmLogEvent {
+                        timestamp_ms: unix_timestamp_ms(),
+                        url: url.to_string(),
+                        request: body.clone(),
+                        response: Some(LlmLogResponse::Text {
+                            status,
+                            body: body_text,
+                        }),
+                        error: Some(error.clone()),
+                    })?;
+                    return Err(StrategyError::Transient(anyhow!(error)));
+                }
+            };
+
+            self.log_event(LlmLogEvent {
+                timestamp_ms: unix_timestamp_ms(),
+                url: url.to_string(),
+                request: body.clone(),
+                response: Some(LlmLogResponse::Json(value.clone())),
+                error: None,
             })?;
             Ok(value)
         } else {
+            self.log_event(LlmLogEvent {
+                timestamp_ms: unix_timestamp_ms(),
+                url: url.to_string(),
+                request: body.clone(),
+                response: Some(LlmLogResponse::Text {
+                    status,
+                    body: body_text.clone(),
+                }),
+                error: Some(format!("http {status}")),
+            })?;
             Err(classify_error(status, &body_text))
         }
     }
@@ -246,6 +319,20 @@ mod tests {
     // (assert_transient / assert_not_supported + one call). A DSL wrapper
     // would add indirection without adding clarity.
     use super::*;
+
+    #[test]
+    fn http_client_default_has_no_logger() {
+        let client = HttpClient::new();
+        assert!(!client.has_logger());
+    }
+
+    #[test]
+    fn http_client_with_logger_reports_logger_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let logger = crate::llm::log::LlmLogger::open(dir.path().join("llm.jsonl")).unwrap();
+        let client = HttpClient::with_timeout_and_logger(Duration::from_secs(1), Some(logger));
+        assert!(client.has_logger());
+    }
 
     fn not_supported_reason(status: u16, body: &str) -> String {
         match classify_error(status, body) {

@@ -58,6 +58,14 @@ struct SubArgs {
     #[arg(long)]
     timeout_seconds: Option<u64>,
 
+    /// Enable raw LLM request/response debug logging
+    #[arg(long)]
+    enable_llm_log: bool,
+
+    /// Append raw LLM request/response debug records to this JSONL file
+    #[arg(long)]
+    llm_log_file: Option<PathBuf>,
+
     /// Debug log to stderr
     #[arg(short, long)]
     verbose: bool,
@@ -74,6 +82,8 @@ fn into_openai_args(a: SubArgs) -> openai::Args {
         json_mode: a.json_mode,
         verbose: a.verbose,
         timeout_seconds: a.timeout_seconds,
+        enable_llm_log: a.enable_llm_log,
+        llm_log_file: a.llm_log_file,
     }
 }
 
@@ -88,6 +98,8 @@ fn into_gemini_args(a: SubArgs) -> gemini::Args {
         json_mode: a.json_mode,
         verbose: a.verbose,
         timeout_seconds: a.timeout_seconds,
+        enable_llm_log: a.enable_llm_log,
+        llm_log_file: a.llm_log_file,
     }
 }
 
@@ -102,6 +114,8 @@ fn into_anthropic_args(a: SubArgs) -> anthropic::Args {
         json_mode: a.json_mode,
         verbose: a.verbose,
         timeout_seconds: a.timeout_seconds,
+        enable_llm_log: a.enable_llm_log,
+        llm_log_file: a.llm_log_file,
     }
 }
 
@@ -116,6 +130,8 @@ fn into_ollama_args(a: SubArgs) -> ollama::Args {
         json_mode: a.json_mode,
         verbose: a.verbose,
         timeout_seconds: a.timeout_seconds,
+        enable_llm_log: a.enable_llm_log,
+        llm_log_file: a.llm_log_file,
     }
 }
 
@@ -130,6 +146,8 @@ fn into_openrouter_args(a: SubArgs) -> openrouter::Args {
         json_mode: a.json_mode,
         verbose: a.verbose,
         timeout_seconds: a.timeout_seconds,
+        enable_llm_log: a.enable_llm_log,
+        llm_log_file: a.llm_log_file,
     }
 }
 

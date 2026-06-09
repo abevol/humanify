@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::cli::preset::{run_preset, PresetArgs, PresetDefaults, ProviderKind};
 
 pub const DEFAULTS: PresetDefaults = PresetDefaults {
+    provider_name: "anthropic",
     base_url: "https://api.anthropic.com/v1",
     model: "claude-sonnet-4-6",
     api_key_env: "ANTHROPIC_API_KEY",
@@ -21,6 +22,8 @@ pub struct Args {
     pub json_mode: String,
     pub verbose: bool,
     pub timeout_seconds: Option<u64>,
+    pub enable_llm_log: bool,
+    pub llm_log_file: Option<PathBuf>,
 }
 
 impl From<Args> for PresetArgs {
@@ -35,6 +38,8 @@ impl From<Args> for PresetArgs {
             json_mode: a.json_mode,
             verbose: a.verbose,
             timeout_seconds: a.timeout_seconds,
+            enable_llm_log: a.enable_llm_log,
+            llm_log_file: a.llm_log_file,
         }
     }
 }

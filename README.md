@@ -139,6 +139,8 @@ humanify <openai|gemini|anthropic|ollama|openrouter> [FLAGS] <INPUT>
 * `--json-mode <MODE>` pins a JSON-mode strategy. Options:
   `ladder` (default), `openai-json-schema`, `anthropic-native`,
   `forced-tool-call`, `tool-call-and-prompt`, `prompt`.
+* `--enable-llm-log` enables raw LLM HTTP request and response logging.
+* `--llm-log-file <PATH>` writes raw LLM logs to a specific JSON Lines file.
 * `-v` enables verbose stderr logging.
 
 Run `humanify --help` for the full reference.
@@ -150,6 +152,28 @@ one out. To unbundle webpack output first, pipe through e.g.
 ```shell
 npx webcrack < bundle.min.js | humanify openai - -o bundle.js
 ```
+
+### Raw LLM logs
+
+For debugging prompt construction or provider responses, pass `--enable-llm-log`:
+
+```shell
+humanify ollama --enable-llm-log app.min.js -o app.js
+```
+
+By default, the log file name is derived from the input file, provider, and
+model, for example `app.min.js-llm-ollama-qwen3.5-4b.jsonl`. Characters
+that are awkward or invalid in file names, such as `/` and `:`, are replaced
+with `-`. Use `--llm-log-file <PATH>` to choose the exact destination:
+
+```shell
+humanify ollama --enable-llm-log --llm-log-file llm.jsonl app.min.js -o app.js
+```
+
+The file uses JSON Lines: one JSON object per LLM HTTP call. You can inspect
+it with tools such as VS Code JSON Lines extensions, `jq`, `jless`, `fx`,
+Logdy, or lnav. The format is also suitable for later forwarding to LLM
+observability tools such as Langfuse.
 
 ### OpenAI mode
 
