@@ -26,6 +26,12 @@ pub struct Args {
     pub log_file: Option<PathBuf>,
     pub no_log_file: bool,
     pub quiet_log: bool,
+    pub resume: bool,
+    pub state_file: Option<PathBuf>,
+    pub max_llm_attempts: u32,
+    pub llm_batch_token_budget: Option<usize>,
+    pub llm_batch_max_symbols: Option<usize>,
+    pub dry_run_no_llm: bool,
 }
 
 impl From<Args> for PresetArgs {
@@ -45,6 +51,12 @@ impl From<Args> for PresetArgs {
             log_file: a.log_file,
             no_log_file: a.no_log_file,
             quiet_log: a.quiet_log,
+            resume: a.resume,
+            state_file: a.state_file,
+            max_llm_attempts: a.max_llm_attempts,
+            llm_batch_token_budget: a.llm_batch_token_budget,
+            llm_batch_max_symbols: a.llm_batch_max_symbols,
+            dry_run_no_llm: a.dry_run_no_llm,
         }
     }
 }

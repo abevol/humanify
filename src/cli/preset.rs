@@ -1,4 +1,5 @@
 use std::env;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,7 +10,11 @@ use crate::llm::{
     JsonStrategy, Ladder, LlmRenamer, OpenAIJsonSchema, PromptToJson, ToolCallAndPrompt,
 };
 use crate::pipe;
-use crate::rename::{rename_all_identifiers_with_progress, RenameError, RenameProgressPhase};
+use crate::rename::inventory::build_symbol_inventory;
+use crate::rename::rules::plan_deterministic_renames;
+use crate::rename::{rename_all_identifiers_with_progress, RenameError, RenameProgressPhase, Renamer};
+use crate::rename::plan::PlanItemState;
+use crate::rename::state::load_state;
 
 pub struct PresetConfig {
     pub base_url: String,
@@ -55,6 +60,12 @@ pub struct PresetArgs {
     pub log_file: Option<PathBuf>,
     pub no_log_file: bool,
     pub quiet_log: bool,
+    pub resume: bool,
+    pub state_file: Option<PathBuf>,
+    pub max_llm_attempts: u32,
+    pub llm_batch_token_budget: Option<usize>,
+    pub llm_batch_max_symbols: Option<usize>,
+    pub dry_run_no_llm: bool,
 }
 
 /// Returns Err with a user-facing message if `mode` is not valid for `kind`.
@@ -159,6 +170,24 @@ pub fn run_preset(args: PresetArgs, defaults: PresetDefaults) -> i32 {
         }
     };
     app_logger.info("input_read", [("bytes", source.len().to_string().as_str())]);
+
+    if args.dry_run_no_llm {
+        let renamed = match run_deterministic_rename_only(&source, cfg.context_size, &app_logger) {
+            Ok(renamed) => renamed,
+            Err(RenameError::Parse(msg)) => {
+                eprintln!("humanify: parse error: {msg}");
+                log_error_and_finish(&app_logger, &timer, "parse_error", &msg, 2);
+                return 2;
+            }
+        }; if let Err(e) = pipe::write_output(output.as_deref(), &renamed) {
+            eprintln!("humanify: failed to write output: {e}");
+            log_error_and_finish(&app_logger, &timer, "output_write_error", &e.to_string(), 1);
+            return 1;
+        }
+        app_logger.info("output_write", [("target", output_label(output.as_ref()).as_str()), ("bytes", renamed.len().to_string().as_str())]);
+        log_finish(&app_logger, &timer, 0);
+        return 0;
+    }
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
@@ -731,6 +760,12 @@ mod tests {
             log_file: None,
             no_log_file: true,
             quiet_log: false,
+            resume: false,
+            state_file: None,
+            max_llm_attempts: 5,
+            llm_batch_token_budget: None,
+            llm_batch_max_symbols: None,
+            dry_run_no_llm: false,
         }
     }
 
@@ -825,5 +860,60 @@ mod tests {
             ProviderKind::Anthropic,
         );
         assert_eq!(ladder.strategy_count(), 1);
+    }
+}
+
+pub fn resume_from_state(state_file: &std::path::Path) -> i32 {
+    match load_state(state_file) {
+        Ok(_) => {
+            eprintln!("humanify: resume is not fully implemented yet for this state file");
+            1
+        }
+        Err(e) => {
+            eprintln!("humanify: failed to load state: {e}");
+            1
+        }
+    }
+}
+
+fn run_deterministic_rename_only(
+    source: &str,
+    context_size: usize,
+    app_logger: &AppLogger,
+) -> Result<String, RenameError> {
+    app_logger.info("inventory_start", [("context_size", context_size.to_string().as_str())]);
+    let inventory = build_symbol_inventory(source, context_size)?;
+    app_logger.info("inventory_finish", [("symbols", inventory.entries.len().to_string().as_str())]);
+    let plan = plan_deterministic_renames(&inventory);
+    let needs_llm = plan.needs_llm_count();
+    app_logger.info("planner_finish", [("resolved", (plan.items.len() - needs_llm).to_string().as_str()), ("needs_llm", needs_llm.to_string().as_str())]);
+    if needs_llm > 0 {
+        eprintln!("humanify: paused because {needs_llm} symbols still require LLM");
+        return Ok(source.to_string());
+    }
+    let names = plan
+        .items
+        .iter()
+        .map(|item| match &item.state {
+            PlanItemState::Resolved { name, .. } => name.clone(),
+            PlanItemState::Keep { .. } => item.original_name.clone(),
+            PlanItemState::NeedsLlm { .. } | PlanItemState::Failed { .. } => item.original_name.clone(),
+        })
+        .collect::<VecDeque<_>>();
+    let mut renamer = QueuePlanRenamer { names };
+    let renamed = rename_all_identifiers_with_progress(source, &mut renamer, context_size, |_| {})?;
+    app_logger.info("apply_finish", [("symbols", plan.items.len().to_string().as_str())]);
+    Ok(renamed)
+}
+
+struct QueuePlanRenamer {
+    names: VecDeque<String>,
+}
+
+impl Renamer for QueuePlanRenamer {
+    fn rename(&mut self, original: &str, _: &str) -> String {
+        self.names
+            .pop_front()
+            .unwrap_or_else(|| original.to_string())
     }
 }
