@@ -29,6 +29,7 @@ pub struct LlmBatchJob {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PromptBatchJob {
     pub id: String,
+    pub required_ids: Vec<u32>,
     pub contexts: Vec<PromptContext>,
 }
 
@@ -42,6 +43,8 @@ pub struct PromptContext {
 pub struct PromptBatchItem {
     pub id: u32,
     pub original: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub hint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,32 +213,169 @@ fn estimate_incremental_tokens(current: &[LlmBatchItem], item: &LlmBatchItem) ->
     12 + context_cost + item.original_name.len() / 4
 }
 
+fn unique_contexts(items: &[LlmBatchItem]) -> Vec<PromptContext> {
+    let mut contexts: Vec<PromptContext> = Vec::new();
+    let mut by_evidence: HashMap<&str, usize> = HashMap::new();
+
+    for item in items {
+        let context_index = match by_evidence.get(item.evidence.as_str()) {
+            Some(index) => *index,
+            None => {
+                let index = contexts.len();
+                by_evidence.insert(item.evidence.as_str(), index);
+                contexts.push(PromptContext {
+                    code: item.evidence.clone(),
+                    items: Vec::new(),
+                });
+                index
+            }
+        };
+        contexts[context_index].items.push(PromptBatchItem {
+            id: item.prompt_id,
+            original: item.original_name.clone(),
+            hint: item_hint(&item.evidence, &item.original_name),
+        });
+    }
+
+    contexts
+}
+
+fn merge_child_contexts(contexts: &mut Vec<PromptContext>) {
+    let mut child_to_parent = HashMap::new();
+
+    for child_index in 0..contexts.len() {
+        let child_code = contexts[child_index].code.as_str();
+        let Some(parent_index) = contexts
+            .iter()
+            .enumerate()
+            .filter(|(candidate_index, candidate)| {
+                *candidate_index != child_index
+                    && candidate.code.len() > child_code.len()
+                    && candidate.code.contains(child_code)
+            })
+            .max_by_key(|(_, candidate)| candidate.code.len())
+            .map(|(candidate_index, _)| candidate_index)
+        else {
+            continue;
+        };
+        child_to_parent.insert(child_index, parent_index);
+    }
+
+    for child_index in 0..contexts.len() {
+        let Some(&parent_index) = child_to_parent.get(&child_index) else {
+            continue;
+        };
+        let child_code = contexts[child_index].code.clone();
+        let mut child_items = std::mem::take(&mut contexts[child_index].items);
+        for item in &mut child_items {
+            item.hint = item_hint(&child_code, &item.original);
+        }
+        contexts[parent_index].items.append(&mut child_items);
+    }
+
+    let mut merged = Vec::with_capacity(contexts.len() - child_to_parent.len());
+    for (index, mut context) in std::mem::take(contexts).into_iter().enumerate() {
+        if child_to_parent.contains_key(&index) {
+            continue;
+        }
+        context.items.sort_by_key(|item| item.id);
+        merged.push(context);
+    }
+    *contexts = merged;
+}
+
+fn item_hint(code: &str, original_name: &str) -> String {
+    let Some(start) = find_identifier(code, original_name) else {
+        return code.chars().take(96).collect();
+    };
+    let line_start = hint_start(code, start);
+    let line_end = code[start..]
+        .find(['\n', ';', '}'])
+        .map(|index| start + index + 1)
+        .unwrap_or(code.len());
+    code[line_start..line_end].chars().take(96).collect()
+}
+
+fn hint_start(code: &str, identifier_start: usize) -> usize {
+    let separator_start = code[..identifier_start]
+        .rfind(['\n', ';', '{'])
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(0);
+    let declaration_start =
+        declaration_start(code, identifier_start).filter(|start| *start >= separator_start);
+    declaration_start
+        .and_then(|start| for_header_start(code, start))
+        .or(declaration_start)
+        .unwrap_or(separator_start)
+}
+
+fn for_header_start(code: &str, declaration_start: usize) -> Option<usize> {
+    let for_start = rfind_keyword_before(code, "for", declaration_start)?;
+    let between = code[for_start + "for".len()..declaration_start].trim();
+    if between == "(" {
+        Some(for_start)
+    } else {
+        None
+    }
+}
+
+fn declaration_start(code: &str, identifier_start: usize) -> Option<usize> {
+    ["const", "let", "var", "function", "class"]
+        .iter()
+        .filter_map(|keyword| rfind_keyword_before(code, keyword, identifier_start))
+        .max()
+}
+
+fn rfind_keyword_before(code: &str, keyword: &str, before: usize) -> Option<usize> {
+    let mut offset = 0;
+    let mut found = None;
+    while let Some(relative_start) = code[offset..before].find(keyword) {
+        let start = offset + relative_start;
+        let end = start + keyword.len();
+        if is_identifier_boundary(code, start, end) {
+            found = Some(start);
+        }
+        offset = end;
+    }
+    found
+}
+
+fn find_identifier(code: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let mut offset = 0;
+    while let Some(relative_start) = code[offset..].find(needle) {
+        let start = offset + relative_start;
+        let end = start + needle.len();
+        if is_identifier_boundary(code, start, end) {
+            return Some(start);
+        }
+        offset = end;
+    }
+    None
+}
+
+fn is_identifier_boundary(code: &str, start: usize, end: usize) -> bool {
+    let before = code[..start].chars().next_back();
+    let after = code[end..].chars().next();
+    before.is_none_or(|ch| !is_identifier_char(ch))
+        && after.is_none_or(|ch| !is_identifier_char(ch))
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+}
+
 impl LlmBatchJob {
     pub fn prompt_payload(&self) -> PromptBatchJob {
-        let mut contexts: Vec<PromptContext> = Vec::new();
-        let mut by_evidence: HashMap<&str, usize> = HashMap::new();
-
-        for item in &self.items {
-            let context_index = match by_evidence.get(item.evidence.as_str()) {
-                Some(index) => *index,
-                None => {
-                    let index = contexts.len();
-                    by_evidence.insert(item.evidence.as_str(), index);
-                    contexts.push(PromptContext {
-                        code: item.evidence.clone(),
-                        items: Vec::new(),
-                    });
-                    index
-                }
-            };
-            contexts[context_index].items.push(PromptBatchItem {
-                id: item.prompt_id,
-                original: item.original_name.clone(),
-            });
-        }
+        let required_ids = self.items.iter().map(|item| item.prompt_id).collect();
+        let mut contexts = unique_contexts(&self.items);
+        merge_child_contexts(&mut contexts);
 
         PromptBatchJob {
             id: self.id.clone(),
+            required_ids,
             contexts,
         }
     }
@@ -310,12 +450,75 @@ mod tests {
             },
         );
         let payload = jobs[0].prompt_payload();
+        assert_eq!(payload.required_ids, vec![0, 1, 2]);
         assert_eq!(payload.contexts.len(), 2);
         assert_eq!(payload.contexts[0].code, "shared code");
         assert_eq!(payload.contexts[0].items.len(), 2);
         assert_eq!(payload.contexts[0].items[0].id, 0);
         assert_eq!(payload.contexts[0].items[1].id, 1);
         assert_eq!(payload.contexts[1].items[0].id, 2);
+        assert!(payload
+            .contexts
+            .iter()
+            .flat_map(|context| context.items.iter())
+            .all(|item| !item.hint.is_empty()));
+    }
+
+    #[test]
+    fn prompt_payload_merges_child_context_items_into_parent_context() {
+        let parent = "function total(a){let o=0;for(let t=0;t<a.length;t++){var r=a[t];o+=r.price*r.quantity}return o}";
+        let child = "for(let t=0;t<a.length;t++){var r=a[t];o+=r.price*r.quantity}";
+        let plan = RenamePlan {
+            items: vec![
+                unresolved("function", "a", parent),
+                unresolved("index", "t", child),
+                unresolved("item", "r", child),
+            ],
+        };
+        let jobs = build_llm_batches(
+            &plan,
+            BatchLimits {
+                max_symbols: 10,
+                token_budget: 1000,
+            },
+        );
+
+        let payload = jobs[0].prompt_payload();
+
+        assert_eq!(payload.required_ids, vec![0, 1, 2]);
+        assert_eq!(payload.contexts.len(), 1);
+        assert_eq!(payload.contexts[0].code, parent);
+        assert_eq!(
+            payload.contexts[0]
+                .items
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(payload.contexts[0].items[1].hint.contains("for(let t=0"));
+        assert!(payload.contexts[0].items[2].hint.contains("var r=a[t]"));
+    }
+
+    #[test]
+    fn prompt_payload_hint_starts_at_const_declaration_after_function_body() {
+        let code = "function calculateShoppingCart(a,t,e){let n=0,o=0;for(let t=0;t<a.length;t++){var r=a[t];o+=r.price*r.quantity}return e&&(n+=.1*o),\"SUMMER20\"===t&&(n+=20),0<(o=(o-=n)+.08*o)?o:0}const myCart=[{name:\"Laptop\",price:999,quantity:1},{name:\"Mouse\",price:49,quantity:2}];console.log(\"Total:\",calculateShoppingCart(myCart,\"SUMMER20\",!0));";
+        let plan = RenamePlan {
+            items: vec![unresolved("cart", "myCart", code)],
+        };
+        let jobs = build_llm_batches(
+            &plan,
+            BatchLimits {
+                max_symbols: 10,
+                token_budget: 1000,
+            },
+        );
+
+        let payload = jobs[0].prompt_payload();
+        let hint = &payload.contexts[0].items[0].hint;
+
+        assert!(hint.starts_with("const myCart="), "hint: {hint}");
+        assert!(!hint.contains("SUMMER20"), "hint: {hint}");
     }
 
     #[test]
@@ -324,6 +527,8 @@ mod tests {
         let json = serde_json::to_string(&job.prompt_payload()).unwrap();
         assert!(!json.contains("symbol_key"), "json: {json}");
         assert!(!json.contains("0123456789abcdef"), "json: {json}");
+        assert!(!json.contains("\"evidence\":"), "json: {json}");
+        assert!(json.contains("\"required_ids\":[0]"), "json: {json}");
         assert!(json.contains("\"id\":0"), "json: {json}");
     }
 

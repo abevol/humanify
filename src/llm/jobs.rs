@@ -9,7 +9,7 @@ use super::JsonStrategy;
 use crate::llm::http::StrategyError;
 use crate::rename::state::RetryPolicy;
 
-const BATCH_SYSTEM_PROMPT: &str = "You rename obfuscated JavaScript identifiers. Return JSON only.";
+const BATCH_SYSTEM_PROMPT: &str = "You rename obfuscated JavaScript identifiers. Return JSON only. Return exactly one rename for every id in required_ids. Do not omit ids. Do not invent ids.";
 
 pub struct JobRunner {
     strategy: Arc<dyn JsonStrategy>,
@@ -108,6 +108,13 @@ fn strategy_error_to_anyhow(err: StrategyError) -> anyhow::Error {
 mod tests {
     use super::*;
     use crate::llm::test_dsl::{script, transient, ScriptedResponse};
+
+    #[test]
+    fn batch_system_prompt_requires_complete_id_coverage() {
+        assert!(BATCH_SYSTEM_PROMPT.contains("required_ids"));
+        assert!(BATCH_SYSTEM_PROMPT.contains("Do not omit ids"));
+        assert!(BATCH_SYSTEM_PROMPT.contains("Do not invent ids"));
+    }
 
     #[tokio::test]
     async fn transient_failure_retries_and_succeeds() {
