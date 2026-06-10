@@ -22,6 +22,7 @@ enum Commands {
     Anthropic(SubArgs),
     Ollama(SubArgs),
     Openrouter(SubArgs),
+    Resume { state_file: PathBuf },
 }
 
 #[derive(Parser)]
@@ -81,6 +82,30 @@ struct SubArgs {
     /// Debug log to stderr
     #[arg(short, long)]
     verbose: bool,
+
+    /// Continue from a matching saved rename state when available
+    #[arg(long)]
+    resume: bool,
+
+    /// Override the saved rename state path
+    #[arg(long)]
+    state_file: Option<PathBuf>,
+
+    /// Maximum LLM attempts before pausing
+    #[arg(long, default_value_t = 5)]
+    max_llm_attempts: u32,
+
+    /// Estimated token budget for each LLM batch
+    #[arg(long)]
+    llm_batch_token_budget: Option<usize>,
+
+    /// Maximum symbols in each LLM batch
+    #[arg(long)]
+    llm_batch_max_symbols: Option<usize>,
+
+    /// Run deterministic planner only; fail if LLM would be needed
+    #[arg(long, hide = true)]
+    dry_run_no_llm: bool,
 }
 
 fn into_openai_args(a: SubArgs) -> openai::Args {
@@ -99,6 +124,12 @@ fn into_openai_args(a: SubArgs) -> openai::Args {
         log_file: a.log_file,
         no_log_file: a.no_log_file,
         quiet_log: a.quiet_log,
+        resume: a.resume,
+        state_file: a.state_file,
+        max_llm_attempts: a.max_llm_attempts,
+        llm_batch_token_budget: a.llm_batch_token_budget,
+        llm_batch_max_symbols: a.llm_batch_max_symbols,
+        dry_run_no_llm: a.dry_run_no_llm,
     }
 }
 
@@ -118,6 +149,12 @@ fn into_gemini_args(a: SubArgs) -> gemini::Args {
         log_file: a.log_file,
         no_log_file: a.no_log_file,
         quiet_log: a.quiet_log,
+        resume: a.resume,
+        state_file: a.state_file,
+        max_llm_attempts: a.max_llm_attempts,
+        llm_batch_token_budget: a.llm_batch_token_budget,
+        llm_batch_max_symbols: a.llm_batch_max_symbols,
+        dry_run_no_llm: a.dry_run_no_llm,
     }
 }
 
@@ -137,6 +174,12 @@ fn into_anthropic_args(a: SubArgs) -> anthropic::Args {
         log_file: a.log_file,
         no_log_file: a.no_log_file,
         quiet_log: a.quiet_log,
+        resume: a.resume,
+        state_file: a.state_file,
+        max_llm_attempts: a.max_llm_attempts,
+        llm_batch_token_budget: a.llm_batch_token_budget,
+        llm_batch_max_symbols: a.llm_batch_max_symbols,
+        dry_run_no_llm: a.dry_run_no_llm,
     }
 }
 
@@ -156,6 +199,12 @@ fn into_ollama_args(a: SubArgs) -> ollama::Args {
         log_file: a.log_file,
         no_log_file: a.no_log_file,
         quiet_log: a.quiet_log,
+        resume: a.resume,
+        state_file: a.state_file,
+        max_llm_attempts: a.max_llm_attempts,
+        llm_batch_token_budget: a.llm_batch_token_budget,
+        llm_batch_max_symbols: a.llm_batch_max_symbols,
+        dry_run_no_llm: a.dry_run_no_llm,
     }
 }
 
@@ -175,6 +224,12 @@ fn into_openrouter_args(a: SubArgs) -> openrouter::Args {
         log_file: a.log_file,
         no_log_file: a.no_log_file,
         quiet_log: a.quiet_log,
+        resume: a.resume,
+        state_file: a.state_file,
+        max_llm_attempts: a.max_llm_attempts,
+        llm_batch_token_budget: a.llm_batch_token_budget,
+        llm_batch_max_symbols: a.llm_batch_max_symbols,
+        dry_run_no_llm: a.dry_run_no_llm,
     }
 }
 
@@ -198,6 +253,7 @@ fn main() {
         Commands::Anthropic(args) => anthropic::run(into_anthropic_args(args)),
         Commands::Ollama(args) => ollama::run(into_ollama_args(args)),
         Commands::Openrouter(args) => openrouter::run(into_openrouter_args(args)),
+        Commands::Resume { state_file } => humanify::cli::preset::resume_from_state(&state_file),
     };
 
     if exit_code != 0 {

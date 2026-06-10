@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::llm::{http::StrategyError, JsonStrategy};
@@ -132,6 +133,17 @@ impl Ladder {
         } else {
             Some(self.strategies[idx].name())
         }
+    }
+}
+
+#[async_trait]
+impl JsonStrategy for Ladder {
+    async fn call(&self, system: &str, user: &str, schema: &Value) -> Result<Value, StrategyError> {
+        Ladder::call(self, system, user, schema).await
+    }
+
+    fn name(&self) -> &'static str {
+        "ladder"
     }
 }
 
